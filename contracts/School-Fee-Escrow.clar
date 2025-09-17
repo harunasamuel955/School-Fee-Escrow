@@ -9,8 +9,14 @@
 (define-constant err-deadline-passed (err u108))
 (define-constant err-deadline-not-reached (err u109))
 (define-constant err-school-not-registered (err u110))
+(define-constant err-payment-plan-not-found (err u111))
+(define-constant err-payment-plan-inactive (err u112))
+(define-constant err-payment-not-due (err u113))
+(define-constant err-payment-already-completed (err u114))
+(define-constant err-insufficient-installments (err u115))
 
 (define-data-var next-escrow-id uint u1)
+(define-data-var next-payment-plan-id uint u1)
 (define-data-var platform-fee-rate uint u250)
 
 (define-map escrows
@@ -53,6 +59,38 @@
     uint
 )
 
+(define-map payment-plans
+    uint
+    {
+        school: principal,
+        total-amount: uint,
+        installment-amount: uint,
+        installment-count: uint,
+        interval-blocks: uint,
+        created-at: uint,
+        is-active: bool,
+    }
+)
+
+(define-map student-payment-subscriptions
+    {
+        student: principal,
+        plan-id: uint,
+    }
+    {
+        payments-made: uint,
+        next-payment-due: uint,
+        status: (string-ascii 20),
+        subscribed-at: uint,
+        last-payment-at: (optional uint),
+    }
+)
+
+(define-map payment-plan-history
+    principal
+    (list 50 uint)
+)
+
 (define-read-only (get-escrow (escrow-id uint))
     (map-get? escrows escrow-id)
 )
@@ -75,6 +113,28 @@
 
 (define-read-only (get-next-escrow-id)
     (var-get next-escrow-id)
+)
+
+(define-read-only (get-next-payment-plan-id)
+    (var-get next-payment-plan-id)
+)
+
+(define-read-only (get-payment-plan (plan-id uint))
+    (map-get? payment-plans plan-id)
+)
+
+(define-read-only (get-payment-subscription
+        (student principal)
+        (plan-id uint)
+    )
+    (map-get? student-payment-subscriptions {
+        student: student,
+        plan-id: plan-id,
+    })
+)
+
+(define-read-only (get-student-payment-plans (student principal))
+    (default-to (list) (map-get? payment-plan-history student))
 )
 
 (define-read-only (get-platform-stat (stat-name (string-ascii 20)))
@@ -462,8 +522,13 @@
 
 (define-read-only (get-total-escrows-by-status (status (string-ascii 20)))
     (fold count-status-escrows
-        (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18 u19
-            u20) {
+        (list
+            u1             u2             u3             u4             u5
+                        u6             u7             u8             u9             u10
+                        u11             u12             u13             u14             u15
+                        u16             u17             u18             u19
+            u20
+        ) {
         target-status: status,
         count: u0,
     })
@@ -502,6 +567,325 @@
     }
 )
 
+(define-public (create-payment-plan
+        (total-amount uint)
+        (installment-count uint)
+        (interval-blocks uint)
+    )
+    (let (
+            (school tx-sender)
+            (plan-id (var-get next-payment-plan-id))
+            (installment-amount (/ total-amount installment-count))
+        )
+        (asserts! (is-school-registered school) err-school-not-registered)
+        (asserts! (> total-amount u0) err-invalid-amount)
+        (asserts! (>= installment-count u2) err-insufficient-installments)
+        (asserts! (> interval-blocks u0) err-invalid-amount)
+        (asserts! (> installment-amount u0) err-invalid-amount)
+
+        (map-set payment-plans plan-id {
+            school: school,
+            total-amount: total-amount,
+            installment-amount: installment-amount,
+            installment-count: installment-count,
+            interval-blocks: interval-blocks,
+            created-at: stacks-block-height,
+            is-active: true,
+        })
+
+        (var-set next-payment-plan-id (+ plan-id u1))
+        (ok plan-id)
+    )
+)
+
+(define-public (subscribe-to-payment-plan (plan-id uint))
+    (let (
+            (student tx-sender)
+            (plan-data (unwrap! (map-get? payment-plans plan-id) err-payment-plan-not-found))
+            (subscription-key {
+                student: student,
+                plan-id: plan-id,
+            })
+        )
+        (asserts! (get is-active plan-data) err-payment-plan-inactive)
+        (asserts!
+            (is-none (map-get? student-payment-subscriptions subscription-key))
+            err-already-exists
+        )
+
+        (map-set student-payment-subscriptions subscription-key {
+            payments-made: u0,
+            next-payment-due: (+ stacks-block-height (get interval-blocks plan-data)),
+            status: "active",
+            subscribed-at: stacks-block-height,
+            last-payment-at: none,
+        })
+
+        (map-set payment-plan-history student
+            (unwrap-panic (as-max-len? (append (get-student-payment-plans student) plan-id) u50))
+        )
+
+        (ok true)
+    )
+)
+
+(define-public (execute-payment-plan-installment
+        (student principal)
+        (plan-id uint)
+    )
+    (let (
+            (plan-data (unwrap! (map-get? payment-plans plan-id) err-payment-plan-not-found))
+            (subscription-key {
+                student: student,
+                plan-id: plan-id,
+            })
+            (subscription-data (unwrap! (map-get? student-payment-subscriptions subscription-key)
+                err-not-found
+            ))
+            (installment-amount (get installment-amount plan-data))
+            (platform-fee (calculate-platform-fee installment-amount))
+            (total-payment (+ installment-amount platform-fee))
+            (payments-made (get payments-made subscription-data))
+        )
+        (asserts! (is-eq (get status subscription-data) "active")
+            err-payment-plan-inactive
+        )
+        (asserts!
+            (>= stacks-block-height (get next-payment-due subscription-data))
+            err-payment-not-due
+        )
+        (asserts! (< payments-made (get installment-count plan-data))
+            err-payment-already-completed
+        )
+        (asserts! (>= (stx-get-balance student) total-payment)
+            err-insufficient-balance
+        )
+
+        (try! (stx-transfer? total-payment student (as-contract tx-sender)))
+
+        (let ((new-payments-made (+ payments-made u1)))
+            (if (< new-payments-made (get installment-count plan-data))
+                (map-set student-payment-subscriptions subscription-key
+                    (merge subscription-data {
+                        payments-made: new-payments-made,
+                        next-payment-due: (+ stacks-block-height (get interval-blocks plan-data)),
+                        last-payment-at: (some stacks-block-height),
+                    })
+                )
+                (begin
+                    (map-set student-payment-subscriptions subscription-key
+                        (merge subscription-data {
+                            payments-made: new-payments-made,
+                            status: "completed",
+                            last-payment-at: (some stacks-block-height),
+                        })
+                    )
+                    (try! (as-contract (stx-transfer?
+                        (* installment-amount (get installment-count plan-data))
+                        tx-sender (get school plan-data)
+                    )))
+                    (try! (as-contract (stx-transfer?
+                        (* platform-fee (get installment-count plan-data))
+                        tx-sender contract-owner
+                    )))
+                )
+            )
+        )
+
+        (map-set platform-stats "payment-plan-volume"
+            (+ (get-platform-stat "payment-plan-volume") installment-amount)
+        )
+        (ok true)
+    )
+)
+
+(define-public (batch-execute-due-payments (payment-list (list 10 {
+    student: principal,
+    plan-id: uint,
+})))
+    (begin
+        (asserts! (is-eq tx-sender contract-owner) err-owner-only)
+        (fold execute-single-payment payment-list (ok u0))
+    )
+)
+
+(define-private (execute-single-payment
+        (payment-info {
+            student: principal,
+            plan-id: uint,
+        })
+        (prev-result (response uint uint))
+    )
+    (match prev-result
+        success-count (match (execute-payment-plan-installment (get student payment-info)
+            (get plan-id payment-info)
+        )
+            payment-success (ok (+ success-count u1))
+            payment-error (ok success-count)
+        )
+        error-val (err error-val)
+    )
+)
+
+(define-public (pause-payment-subscription
+        (student principal)
+        (plan-id uint)
+    )
+    (let (
+            (subscription-key {
+                student: student,
+                plan-id: plan-id,
+            })
+            (subscription-data (unwrap! (map-get? student-payment-subscriptions subscription-key)
+                err-not-found
+            ))
+        )
+        (asserts! (or (is-eq tx-sender student) (is-eq tx-sender contract-owner))
+            err-unauthorized
+        )
+        (asserts! (is-eq (get status subscription-data) "active")
+            err-payment-plan-inactive
+        )
+
+        (map-set student-payment-subscriptions subscription-key
+            (merge subscription-data { status: "paused" })
+        )
+        (ok true)
+    )
+)
+
+(define-public (resume-payment-subscription
+        (student principal)
+        (plan-id uint)
+    )
+    (let (
+            (subscription-key {
+                student: student,
+                plan-id: plan-id,
+            })
+            (subscription-data (unwrap! (map-get? student-payment-subscriptions subscription-key)
+                err-not-found
+            ))
+            (plan-data (unwrap! (map-get? payment-plans plan-id) err-payment-plan-not-found))
+        )
+        (asserts! (or (is-eq tx-sender student) (is-eq tx-sender contract-owner))
+            err-unauthorized
+        )
+        (asserts! (is-eq (get status subscription-data) "paused")
+            err-payment-plan-inactive
+        )
+
+        (map-set student-payment-subscriptions subscription-key
+            (merge subscription-data {
+                status: "active",
+                next-payment-due: (+ stacks-block-height (get interval-blocks plan-data)),
+            })
+        )
+        (ok true)
+    )
+)
+
+(define-public (cancel-payment-subscription
+        (student principal)
+        (plan-id uint)
+    )
+    (let (
+            (subscription-key {
+                student: student,
+                plan-id: plan-id,
+            })
+            (subscription-data (unwrap! (map-get? student-payment-subscriptions subscription-key)
+                err-not-found
+            ))
+        )
+        (asserts! (or (is-eq tx-sender student) (is-eq tx-sender contract-owner))
+            err-unauthorized
+        )
+        (asserts! (not (is-eq (get status subscription-data) "completed"))
+            err-payment-already-completed
+        )
+
+        (map-set student-payment-subscriptions subscription-key
+            (merge subscription-data { status: "cancelled" })
+        )
+        (ok true)
+    )
+)
+
+(define-public (toggle-payment-plan-status (plan-id uint))
+    (let (
+            (plan-data (unwrap! (map-get? payment-plans plan-id) err-payment-plan-not-found))
+            (school (get school plan-data))
+        )
+        (asserts! (is-eq tx-sender school) err-unauthorized)
+
+        (map-set payment-plans plan-id
+            (merge plan-data { is-active: (not (get is-active plan-data)) })
+        )
+        (ok true)
+    )
+)
+
+(define-read-only (get-payment-plan-summary (plan-id uint))
+    (match (map-get? payment-plans plan-id)
+        plan-data (some {
+            plan-id: plan-id,
+            school: (get school plan-data),
+            total-amount: (get total-amount plan-data),
+            installment-amount: (get installment-amount plan-data),
+            installment-count: (get installment-count plan-data),
+            interval-blocks: (get interval-blocks plan-data),
+            is-active: (get is-active plan-data),
+            created-at: (get created-at plan-data),
+        })
+        none
+    )
+)
+
+(define-read-only (get-subscription-summary
+        (student principal)
+        (plan-id uint)
+    )
+    (match (get-payment-subscription student plan-id)
+        subscription-data (match (get-payment-plan plan-id)
+            plan-data (some {
+                student: student,
+                plan-id: plan-id,
+                payments-made: (get payments-made subscription-data),
+                payments-remaining: (- (get installment-count plan-data)
+                    (get payments-made subscription-data)
+                ),
+                next-payment-due: (get next-payment-due subscription-data),
+                status: (get status subscription-data),
+                blocks-until-next: (if (> (get next-payment-due subscription-data)
+                        stacks-block-height
+                    )
+                    (- (get next-payment-due subscription-data)
+                        stacks-block-height
+                    )
+                    u0
+                ),
+            })
+            none
+        )
+        none
+    )
+)
+
+(define-read-only (calculate-total-plan-cost (plan-id uint))
+    (match (get-payment-plan plan-id)
+        plan-data (let (
+                (total-amount (get total-amount plan-data))
+                (installment-count (get installment-count plan-data))
+                (platform-fee-per-payment (calculate-platform-fee (get installment-amount plan-data)))
+                (total-platform-fees (* platform-fee-per-payment installment-count))
+            )
+            (some (+ total-amount total-platform-fees))
+        )
+        none
+    )
+)
+
 (define-public (update-school-registration-fee (new-fee uint))
     (let (
             (school tx-sender)
@@ -533,8 +917,14 @@
     (let ((caller tx-sender))
         (asserts! (is-eq caller contract-owner) err-owner-only)
         (fold refund-if-expired
-            (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10 u11 u12 u13 u14 u15 u16 u17 u18
-                u19 u20)
+            (list
+                u1                 u2                 u3                 u4
+                                u5                 u6                 u7                 u8
+                                u9                 u10                 u11                 u12
+                                u13                 u14                 u15                 u16
+                                u17                 u18
+                u19                 u20
+            )
             (ok u0)
         )
     )
@@ -615,3 +1005,4 @@
 (map-set platform-stats "total-released" u0)
 (map-set platform-stats "total-refunded" u0)
 (map-set platform-stats "total-disputes" u0)
+(map-set platform-stats "payment-plan-volume" u0)
