@@ -34,6 +34,14 @@
     }
 )
 
+(define-map escrow-early-release-approvals
+    uint
+    {
+        student-approved: bool,
+        school-approved: bool,
+    }
+)
+
 (define-map registered-schools
     principal
     {
@@ -264,6 +272,95 @@
 
         (var-set next-escrow-id (+ escrow-id u1))
         (ok escrow-id)
+    )
+)
+
+(define-public (approve-early-release (escrow-id uint))
+    (let (
+            (escrow-data (unwrap! (map-get? escrows escrow-id) err-not-found))
+            (student (get student escrow-data))
+            (school (get school escrow-data))
+            (approvals (default-to {
+                student-approved: false,
+                school-approved: false,
+            }
+                (map-get? escrow-early-release-approvals escrow-id)
+            ))
+            (new-approvals (if (is-eq tx-sender student)
+                {
+                    student-approved: true,
+                    school-approved: (get school-approved approvals),
+                }
+                {
+                    student-approved: (get student-approved approvals),
+                    school-approved: true,
+                }
+            ))
+        )
+        (asserts! (is-eq (get status escrow-data) "active") err-escrow-not-active)
+        (asserts! (or (is-eq tx-sender student) (is-eq tx-sender school))
+            err-unauthorized
+        )
+        (map-set escrow-early-release-approvals escrow-id new-approvals)
+        (ok new-approvals)
+    )
+)
+
+(define-read-only (get-early-release-status (escrow-id uint))
+    (match (map-get? escrows escrow-id)
+        escrow-data (let (
+                (approvals (default-to {
+                    student-approved: false,
+                    school-approved: false,
+                }
+                    (map-get? escrow-early-release-approvals escrow-id)
+                ))
+                (ready (and
+                    (is-eq (get status escrow-data) "active")
+                    (get student-approved approvals)
+                    (get school-approved approvals)
+                ))
+            )
+            (some {
+                student-approved: (get student-approved approvals),
+                school-approved: (get school-approved approvals),
+                ready: ready,
+            })
+        )
+        none
+    )
+)
+
+(define-public (execute-early-release (escrow-id uint))
+    (let (
+            (escrow-data (unwrap! (map-get? escrows escrow-id) err-not-found))
+            (amount (get amount escrow-data))
+            (fee-amount (get fee-amount escrow-data))
+            (school (get school escrow-data))
+            (approvals (default-to {
+                student-approved: false,
+                school-approved: false,
+            }
+                (map-get? escrow-early-release-approvals escrow-id)
+            ))
+        )
+        (asserts! (is-eq (get status escrow-data) "active") err-escrow-not-active)
+        (asserts!
+            (and (get student-approved approvals) (get school-approved approvals))
+            err-unauthorized
+        )
+        (try! (as-contract (stx-transfer? amount tx-sender school)))
+        (try! (as-contract (stx-transfer? fee-amount tx-sender contract-owner)))
+        (map-set escrows escrow-id
+            (merge escrow-data {
+                status: "released",
+                released-at: (some stacks-block-height),
+            })
+        )
+        (map-set platform-stats "total-released"
+            (+ (get-platform-stat "total-released") u1)
+        )
+        (ok true)
     )
 )
 
