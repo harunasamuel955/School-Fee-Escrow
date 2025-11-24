@@ -1079,6 +1079,86 @@
     )
 )
 
+(define-private (calculate-school-dashboard
+        (escrow-id uint)
+        (data {
+            total-escrows: uint,
+            active-escrows: uint,
+            disputed-escrows: uint,
+            refunded-escrows: uint,
+            released-escrows: uint,
+            total-volume: uint,
+        })
+    )
+    (match (map-get? escrows escrow-id)
+        escrow-data (let (
+                (status (get status escrow-data))
+                (amount (get amount escrow-data))
+                (is-active-status (is-eq status "active"))
+                (is-disputed-status (is-eq status "disputed"))
+                (is-refunded-status (or
+                    (is-eq status "refunded")
+                    (is-eq status "emergency-refunded")
+                    (is-eq status "auto-refunded")
+                ))
+                (is-released-status (is-eq status "released"))
+            )
+            {
+                total-escrows: (+ (get total-escrows data) u1),
+                active-escrows: (+ (get active-escrows data)
+                    (if is-active-status
+                        u1
+                        u0
+                    )),
+                disputed-escrows: (+ (get disputed-escrows data)
+                    (if is-disputed-status
+                        u1
+                        u0
+                    )),
+                refunded-escrows: (+ (get refunded-escrows data)
+                    (if is-refunded-status
+                        u1
+                        u0
+                    )),
+                released-escrows: (+ (get released-escrows data)
+                    (if is-released-status
+                        u1
+                        u0
+                    )),
+                total-volume: (+ (get total-volume data) amount),
+            }
+        )
+        data
+    )
+)
+
+(define-read-only (get-school-dashboard (school principal))
+    (let (
+            (initial-data {
+                total-escrows: u0,
+                active-escrows: u0,
+                disputed-escrows: u0,
+                refunded-escrows: u0,
+                released-escrows: u0,
+                total-volume: u0,
+            })
+            (stats (fold calculate-school-dashboard (get-school-history school)
+                initial-data
+            ))
+            (earnings (get-school-earnings school))
+        )
+        {
+            total-escrows: (get total-escrows stats),
+            active-escrows: (get active-escrows stats),
+            disputed-escrows: (get disputed-escrows stats),
+            refunded-escrows: (get refunded-escrows stats),
+            released-escrows: (get released-escrows stats),
+            total-volume: (get total-volume stats),
+            total-earnings: earnings,
+        }
+    )
+)
+
 (define-read-only (get-student-total-paid (student principal))
     (fold calculate-student-payments (get-student-history student) u0)
 )
